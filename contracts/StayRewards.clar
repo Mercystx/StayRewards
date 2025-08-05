@@ -1,5 +1,5 @@
-;; StayRewards - Decentralized Hotel Loyalty Program
-;; A smart contract for managing hotel loyalty points and rewards
+;; StayRewards - Decentralized Hotel Loyalty Program with NFT Stay Certificates
+;; A smart contract for managing hotel loyalty points, rewards, and collectible stay NFTs
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -11,11 +11,17 @@
 (define-constant err-already-registered (err u105))
 (define-constant err-invalid-stay (err u106))
 (define-constant err-unauthorized (err u107))
+(define-constant err-nft-not-found (err u108))
+(define-constant err-not-nft-owner (err u109))
+
+;; NFT Definition
+(define-non-fungible-token stay-certificate uint)
 
 ;; Data Variables
 (define-data-var total-hotels uint u0)
 (define-data-var total-guests uint u0)
 (define-data-var total-points-issued uint u0)
+(define-data-var last-token-id uint u0)
 
 ;; Data Maps
 (define-map hotels principal {
@@ -39,11 +45,22 @@
     check-out-block: uint,
     points-earned: uint,
     amount-spent: uint,
-    is-completed: bool
+    is-completed: bool,
+    nft-id: (optional uint)
 })
 
 (define-map guest-points principal uint)
 (define-map stay-counter uint uint)
+
+;; NFT Metadata Map
+(define-map nft-metadata uint {
+    stay-id: uint,
+    hotel-name: (string-ascii 50),
+    guest: principal,
+    completion-date: uint,
+    amount-spent: uint,
+    points-earned: uint
+})
 
 ;; Initialize stay counter
 (map-set stay-counter u0 u0)
@@ -110,48 +127,85 @@
             check-out-block: u0,
             points-earned: points-earned,
             amount-spent: amount-spent,
-            is-completed: false
+            is-completed: false,
+            nft-id: none
         })
         
         ;; Update counters
         (map-set stay-counter u0 stay-id)
         
-        ;; Award points to guest - now properly validated
-        (let ((award-result (award-points guest points-earned)))
-            (unwrap! award-result err-invalid-amount)
-        )
+        ;; Award points to guest
+        (unwrap! (award-points guest points-earned) err-invalid-amount)
         
         (ok stay-id)
     )
 )
 
-;; Complete a hotel stay
+;; Complete a hotel stay and mint NFT certificate
 (define-public (complete-stay (stay-id uint))
     (let (
         (stay-data (unwrap! (map-get? hotel-stays stay-id) err-not-found))
         (hotel-principal tx-sender)
         (guest-principal (get guest stay-data))
+        (hotel-data (unwrap! (map-get? hotels hotel-principal) err-hotel-not-registered))
     )
         (asserts! (is-eq (get hotel stay-data) hotel-principal) err-unauthorized)
         (asserts! (not (get is-completed stay-data)) err-invalid-stay)
+        (asserts! (is-none (get nft-id stay-data)) err-invalid-stay)
         
-        (map-set hotel-stays stay-id (merge stay-data {
-            check-out-block: stacks-block-height,
-            is-completed: true
-        }))
-        
-        ;; Update guest profile with proper validation
-        (let ((guest-data (unwrap! (map-get? guest-profiles guest-principal) err-not-found)))
-            (let ((new-stay-count (+ (get total-stays guest-data) u1)))
-                (map-set guest-profiles guest-principal (merge guest-data {
-                    total-stays: new-stay-count,
-                    last-activity: stacks-block-height,
-                    tier-level: (calculate-tier-level new-stay-count)
-                }))
+        ;; Mint NFT certificate
+        (let ((nft-id (+ (var-get last-token-id) u1)))
+            ;; Update last token ID
+            (var-set last-token-id nft-id)
+            
+            ;; Mint NFT to guest
+            (unwrap! (nft-mint? stay-certificate nft-id guest-principal) err-invalid-stay)
+            
+            ;; Store NFT metadata
+            (map-set nft-metadata nft-id {
+                stay-id: stay-id,
+                hotel-name: (get name hotel-data),
+                guest: guest-principal,
+                completion-date: stacks-block-height,
+                amount-spent: (get amount-spent stay-data),
+                points-earned: (get points-earned stay-data)
+            })
+            
+            ;; Update stay with completion and NFT ID
+            (map-set hotel-stays stay-id (merge stay-data {
+                check-out-block: stacks-block-height,
+                is-completed: true,
+                nft-id: (some nft-id)
+            }))
+            
+            ;; Update guest profile with proper validation
+            (let ((guest-data (unwrap! (map-get? guest-profiles guest-principal) err-not-found)))
+                (let ((new-stay-count (+ (get total-stays guest-data) u1)))
+                    (map-set guest-profiles guest-principal (merge guest-data {
+                        total-stays: new-stay-count,
+                        last-activity: stacks-block-height,
+                        tier-level: (calculate-tier-level new-stay-count)
+                    }))
+                )
             )
+            
+            (ok nft-id)
         )
+    )
+)
+
+;; Transfer NFT stay certificate
+(define-public (transfer-certificate (nft-id uint) (sender principal) (recipient principal))
+    (let ((current-owner (unwrap! (nft-get-owner? stay-certificate nft-id) err-nft-not-found)))
+        ;; Verify that the sender is the transaction sender
+        (asserts! (is-eq tx-sender sender) err-unauthorized)
+        ;; Verify that the sender actually owns the NFT
+        (asserts! (is-eq current-owner sender) err-not-nft-owner)
+        ;; Verify that sender and recipient are different
+        (asserts! (not (is-eq sender recipient)) err-invalid-amount)
         
-        (ok true)
+        ;; Perform the transfer
+        (nft-transfer? stay-certificate nft-id sender recipient)
     )
 )
 
@@ -161,6 +215,8 @@
         (current-points (default-to u0 (map-get? guest-points guest)))
         (guest-data (unwrap! (map-get? guest-profiles guest) err-not-found))
     )
+        (asserts! (> points u0) err-invalid-amount)
+        
         (map-set guest-points guest (+ current-points points))
         (map-set guest-profiles guest (merge guest-data {
             total-points: (+ (get total-points guest-data) points),
@@ -225,12 +281,38 @@
     (map-get? hotel-stays stay-id)
 )
 
+;; Get NFT metadata
+(define-read-only (get-nft-metadata (nft-id uint))
+    (map-get? nft-metadata nft-id)
+)
+
+;; Get NFT owner
+(define-read-only (get-certificate-owner (nft-id uint))
+    (nft-get-owner? stay-certificate nft-id)
+)
+
+;; Get last token ID
+(define-read-only (get-last-token-id)
+    (var-get last-token-id)
+)
+
+;; Check if guest owns a specific certificate
+(define-read-only (guest-owns-certificate (guest principal) (nft-id uint))
+    (is-eq (some guest) (nft-get-owner? stay-certificate nft-id))
+)
+
+;; Get total number of certificates minted
+(define-read-only (get-total-certificates)
+    (var-get last-token-id)
+)
+
 ;; Get contract statistics
 (define-read-only (get-contract-stats)
     {
         total-hotels: (var-get total-hotels),
         total-guests: (var-get total-guests),
-        total-points-issued: (var-get total-points-issued)
+        total-points-issued: (var-get total-points-issued),
+        total-certificates: (var-get last-token-id)
     }
 )
 
