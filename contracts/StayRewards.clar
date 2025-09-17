@@ -1,5 +1,6 @@
 ;; StayRewards - Decentralized Hotel Loyalty Program with NFT Stay Certificates
 ;; A smart contract for managing hotel loyalty points, rewards, and collectible stay NFTs
+;; Now with Cross-Chain Points Bridge functionality
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -13,6 +14,11 @@
 (define-constant err-unauthorized (err u107))
 (define-constant err-nft-not-found (err u108))
 (define-constant err-not-nft-owner (err u109))
+(define-constant err-bridge-not-authorized (err u110))
+(define-constant err-invalid-chain (err u111))
+(define-constant err-bridge-paused (err u112))
+(define-constant err-invalid-bridge-operator (err u113))
+(define-constant err-duplicate-bridge-tx (err u114))
 
 ;; NFT Definition
 (define-non-fungible-token stay-certificate uint)
@@ -22,6 +28,9 @@
 (define-data-var total-guests uint u0)
 (define-data-var total-points-issued uint u0)
 (define-data-var last-token-id uint u0)
+(define-data-var bridge-enabled bool true)
+(define-data-var total-points-bridged-out uint u0)
+(define-data-var total-points-bridged-in uint u0)
 
 ;; Data Maps
 (define-map hotels principal {
@@ -62,8 +71,32 @@
     points-earned: uint
 })
 
-;; Initialize stay counter
+;; Cross-Chain Bridge Maps
+(define-map bridge-operators principal bool)
+(define-map supported-chains (string-ascii 20) bool)
+(define-map bridge-transactions (string-ascii 64) {
+    guest: principal,
+    amount: uint,
+    target-chain: (string-ascii 20),
+    target-address: (string-ascii 64),
+    timestamp: uint,
+    is-processed: bool
+})
+
+(define-map incoming-bridge-txs (string-ascii 64) {
+    guest: principal,
+    amount: uint,
+    source-chain: (string-ascii 20),
+    source-address: (string-ascii 64),
+    timestamp: uint,
+    is-processed: bool
+})
+
+;; Initialize stay counter and bridge settings
 (map-set stay-counter u0 u0)
+(map-set bridge-operators contract-owner true)
+(map-set supported-chains "ethereum" true)
+(map-set supported-chains "polygon" true)
 
 ;; Public Functions
 
@@ -209,21 +242,168 @@
     )
 )
 
+;; Cross-Chain Bridge Functions
+
+;; Bridge points to another chain
+(define-public (bridge-points-out (amount uint) (target-chain (string-ascii 20)) (target-address (string-ascii 64)) (tx-hash (string-ascii 64)))
+    (let (
+        (guest-principal tx-sender)
+        (current-points (default-to u0 (map-get? guest-points guest-principal)))
+        (guest-data (unwrap! (map-get? guest-profiles guest-principal) err-not-found))
+    )
+        ;; Validate inputs
+        (asserts! (var-get bridge-enabled) err-bridge-paused)
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (> (len target-chain) u0) err-invalid-chain)
+        (asserts! (> (len target-address) u0) err-invalid-amount)
+        (asserts! (> (len tx-hash) u0) err-invalid-amount)
+        (asserts! (default-to false (map-get? supported-chains target-chain)) err-invalid-chain)
+        (asserts! (>= current-points amount) err-insufficient-points)
+        (asserts! (is-none (map-get? bridge-transactions tx-hash)) err-duplicate-bridge-tx)
+        
+        ;; Burn points from guest account
+        (map-set guest-points guest-principal (- current-points amount))
+        
+        ;; Record bridge transaction
+        (map-set bridge-transactions tx-hash {
+            guest: guest-principal,
+            amount: amount,
+            target-chain: target-chain,
+            target-address: target-address,
+            timestamp: stacks-block-height,
+            is-processed: false
+        })
+        
+        ;; Update guest profile
+        (map-set guest-profiles guest-principal (merge guest-data {
+            last-activity: stacks-block-height
+        }))
+        
+        ;; Update total points bridged out
+        (var-set total-points-bridged-out (+ (var-get total-points-bridged-out) amount))
+        
+        (ok true)
+    )
+)
+
+;; Process incoming bridge transaction (only by authorized bridge operators)
+(define-public (bridge-points-in (guest principal) (amount uint) (source-chain (string-ascii 20)) (source-address (string-ascii 64)) (tx-hash (string-ascii 64)))
+    (let (
+        (operator tx-sender)
+    )
+        ;; Validate operator authorization first
+        (asserts! (default-to false (map-get? bridge-operators operator)) err-bridge-not-authorized)
+        (asserts! (var-get bridge-enabled) err-bridge-paused)
+        
+        ;; Validate all inputs
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (> (len source-chain) u0) err-invalid-chain)
+        (asserts! (> (len source-address) u0) err-invalid-amount)
+        (asserts! (> (len tx-hash) u0) err-invalid-amount)
+        (asserts! (default-to false (map-get? supported-chains source-chain)) err-invalid-chain)
+        (asserts! (is-none (map-get? incoming-bridge-txs tx-hash)) err-duplicate-bridge-tx)
+        
+        ;; Validate guest exists and amount is valid, then process
+        (let ((guest-data (unwrap! (map-get? guest-profiles guest) err-not-found))
+              (validated-guest guest)
+              (validated-amount amount))
+            ;; Additional validation after binding
+            (asserts! (> validated-amount u0) err-invalid-amount)
+            (asserts! (not (is-eq validated-guest 'SP000000000000000000002Q6VF78)) err-invalid-amount)
+            
+            ;; Record incoming transaction
+            (map-set incoming-bridge-txs tx-hash {
+                guest: validated-guest,
+                amount: validated-amount,
+                source-chain: source-chain,
+                source-address: source-address,
+                timestamp: stacks-block-height,
+                is-processed: true
+            })
+            
+            ;; Mint points to guest account using validated parameters
+            (unwrap! (award-points validated-guest validated-amount) err-invalid-amount)
+            
+            ;; Update total points bridged in
+            (var-set total-points-bridged-in (+ (var-get total-points-bridged-in) validated-amount))
+            
+            (ok true)
+        )
+    )
+)
+
+;; Admin Functions for Bridge Management
+
+;; Add bridge operator
+(define-public (add-bridge-operator (operator principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Validate that the operator principal is not null/empty
+        (asserts! (not (is-eq operator 'SP000000000000000000002Q6VF78)) err-invalid-amount)
+        (map-set bridge-operators operator true)
+        (ok true)
+    )
+)
+
+;; Remove bridge operator
+(define-public (remove-bridge-operator (operator principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Validate that the operator exists and is not the contract owner
+        (asserts! (not (is-eq operator contract-owner)) err-unauthorized)
+        (asserts! (not (is-eq operator 'SP000000000000000000002Q6VF78)) err-invalid-amount)
+        ;; Check that the operator is currently authorized before removing
+        (asserts! (default-to false (map-get? bridge-operators operator)) err-not-found)
+        (map-set bridge-operators operator false)
+        (ok true)
+    )
+)
+
+;; Add supported chain
+(define-public (add-supported-chain (chain (string-ascii 20)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> (len chain) u0) err-invalid-chain)
+        (map-set supported-chains chain true)
+        (ok true)
+    )
+)
+
+;; Remove supported chain
+(define-public (remove-supported-chain (chain (string-ascii 20)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> (len chain) u0) err-invalid-chain)
+        (map-set supported-chains chain false)
+        (ok true)
+    )
+)
+
+;; Toggle bridge enabled/disabled
+(define-public (toggle-bridge (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set bridge-enabled enabled)
+        (ok true)
+    )
+)
+
 ;; Award points to a guest
 (define-private (award-points (guest principal) (points uint))
     (let (
         (current-points (default-to u0 (map-get? guest-points guest)))
         (guest-data (unwrap! (map-get? guest-profiles guest) err-not-found))
+        (validated-points points)
     )
-        (asserts! (> points u0) err-invalid-amount)
+        (asserts! (> validated-points u0) err-invalid-amount)
         
-        (map-set guest-points guest (+ current-points points))
+        (map-set guest-points guest (+ current-points validated-points))
         (map-set guest-profiles guest (merge guest-data {
-            total-points: (+ (get total-points guest-data) points),
+            total-points: (+ (get total-points guest-data) validated-points),
             last-activity: stacks-block-height
         }))
         
-        (var-set total-points-issued (+ (var-get total-points-issued) points))
+        (var-set total-points-issued (+ (var-get total-points-issued) validated-points))
         (ok true)
     )
 )
@@ -306,13 +486,52 @@
     (var-get last-token-id)
 )
 
+;; Bridge-related read-only functions
+
+;; Check if chain is supported
+(define-read-only (is-chain-supported (chain (string-ascii 20)))
+    (default-to false (map-get? supported-chains chain))
+)
+
+;; Check if principal is bridge operator
+(define-read-only (is-bridge-operator (operator principal))
+    (default-to false (map-get? bridge-operators operator))
+)
+
+;; Get bridge transaction info
+(define-read-only (get-bridge-transaction (tx-hash (string-ascii 64)))
+    (map-get? bridge-transactions tx-hash)
+)
+
+;; Get incoming bridge transaction info
+(define-read-only (get-incoming-bridge-transaction (tx-hash (string-ascii 64)))
+    (map-get? incoming-bridge-txs tx-hash)
+)
+
+;; Check if bridge is enabled
+(define-read-only (is-bridge-enabled)
+    (var-get bridge-enabled)
+)
+
+;; Get bridge statistics
+(define-read-only (get-bridge-stats)
+    {
+        total-points-bridged-out: (var-get total-points-bridged-out),
+        total-points-bridged-in: (var-get total-points-bridged-in),
+        bridge-enabled: (var-get bridge-enabled)
+    }
+)
+
 ;; Get contract statistics
 (define-read-only (get-contract-stats)
     {
         total-hotels: (var-get total-hotels),
         total-guests: (var-get total-guests),
         total-points-issued: (var-get total-points-issued),
-        total-certificates: (var-get last-token-id)
+        total-certificates: (var-get last-token-id),
+        total-points-bridged-out: (var-get total-points-bridged-out),
+        total-points-bridged-in: (var-get total-points-bridged-in),
+        bridge-enabled: (var-get bridge-enabled)
     }
 )
 
